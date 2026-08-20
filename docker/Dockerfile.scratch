@@ -1,0 +1,169 @@
+# =============================================================================
+# Quilt Base — Scratch variant
+# =============================================================================
+# The most minimal Quilt base. Use this when:
+#   * Your agent is a SINGLE STATICALLY-LINKED BINARY (Rust with musl,
+#     Go with CGO_ENABLED=0, Zig, or a hand-rolled C program).
+#   * You are willing to accept that there is no shell, no `ls`, no
+#     `cat`, no `echo`, no init. There is ONLY your binary.
+#   * You need the absolute smallest possible attack surface and image
+#     size (target: ~4 MB, dominated by the binary itself).
+#
+# This is the variant you want for a security-critical sidecar, an
+# init-container that just runs `wget --post-data=...`, or a static
+# "Hello, Quilt" health probe.
+#
+# Critical rules:
+#   1. Your binary MUST be statically linked (no dynamic loader lookup).
+#   2. Your binary MUST NOT depend on /etc/passwd, /etc/nsswitch.conf,
+#      or any other file you did not COPY in.
+#   3. Your binary MUST handle SIGTERM / SIGINT cleanly OR you must
+#      have PID 1 be a tiny `tini`-equivalent written into the binary.
+#   4. The downstream `docker run` MUST pass `--read-only` and `--tmpfs /tmp`
+#      for safety; the image itself is empty enough that read-only works.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1 — Build the agent binary
+# -----------------------------------------------------------------------------
+# This is a TEMPLATE; downstream agents replace the RUN command with their
+# own build steps. We ship a working example (a tiny C "Hello, Quilt"
+# binary) so this Dockerfile can be `docker build`d as-is for smoke tests.
+# -----------------------------------------------------------------------------
+FROM ubuntu:24.04 AS builder
+
+# Heavy header: toolchain stage. None of this lands in the final image.
+ARG DEBIAN_FRONTEND=noninteractive
+ARG BINARY_NAME=quilt-agent
+ARG BINARY_PATH=/usr/local/bin/${BINARY_NAME}
+
+RUN set -eux; \
+    apt-get update -y; \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        libc-dev \
+        ca-certificates \
+    ; \
+    rm -rf /var/lib/apt/lists/*; \
+    true
+
+WORKDIR /src
+
+# Template C source: a statically-linked "Hello, Quilt" binary. Replace
+# this with your agent's actual build. The critical bits:
+#   * `-static`  → no dynamic linker
+#   * `-Os`      → size optimization
+#   * `-s`       → strip symbols
+#   * `-ffunction-sections -fdata-sections` + `-Wl,--gc-sections` → drop
+#     every unused function/data section
+COPY <<'EOF' /src/main.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+
+static volatile sig_atomic_t should_exit = 0;
+static void on_signal(int sig) { (void)sig; should_exit = 1; }
+
+int main(void) {
+    signal(SIGTERM, on_signal);
+    signal(SIGINT,  on_signal);
+    signal(SIGHUP,  on_signal);
+    fprintf(stdout, "Hello, Quilt! PID=%d\n", (int)getpid());
+    fflush(stdout);
+    /* Stay alive until signalled — same shape as a real agent loop. */
+    while (!should_exit) {
+        sleep(60);
+    }
+    fprintf(stdout, "Goodbye, Quilt.\n");
+    return 0;
+}
+EOF
+
+# Heavy header: build flags documented inline.
+RUN set -eux; \
+    gcc -static -Os -s \
+        -ffunction-sections -fdata-sections \
+        -Wl,--gc-sections -Wl,-z,now -Wl,-z,relro \
+        -o "${BINARY_PATH}" \
+        /src/main.c; \
+    # Verify the binary is actually static. \
+    file "${BINARY_PATH}"; \
+    ldd "${BINARY_PATH}" || true; \
+    # Compress the final binary with UPX (optional but common in Quilt). \
+    # UPX must be installed at the build host; if absent, skip. \
+    command -v upx >/dev/null 2>&1 && upx --best --lzma "${BINARY_PATH}" || true; \
+    # Verify size is reasonable. \
+    ls -lh "${BINARY_PATH}"; \
+    true
+
+# -----------------------------------------------------------------------------
+# Stage 2 — CA bundle staging
+# -----------------------------------------------------------------------------
+# We need a CA bundle at runtime for any TLS work. Copy it from the
+# builder so the final image is not completely empty.
+# -----------------------------------------------------------------------------
+FROM scratch AS rootfs
+
+# Heavy header: the final image. EVERY byte is intentional.
+
+# CA bundle for outbound TLS. Without this, libcurl / openssl / rustls
+# will reject every HTTPS endpoint.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# /etc/passwd with a single `quilt` user. Some libc stubs (musl)
+# require this even if you never call getpwnam().
+COPY --from=builder /etc/passwd /etc/passwd
+
+# Timezone data, in case the agent converts timestamps. Tiny, optional,
+# but a common gotcha.
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+
+# The binary itself.
+COPY --from=builder /usr/local/bin/quilt-agent /quilt/bin/agent
+
+# -----------------------------------------------------------------------------
+# Stage 3 — Final image with metadata
+# -----------------------------------------------------------------------------
+# `FROM scratch` cannot have ARGs, but the OCI spec still allows labels
+# to be attached. The build tooling (buildx, buildah) reads them.
+# -----------------------------------------------------------------------------
+FROM rootfs AS final
+
+# Heavy header: published layer. This is a 4-MB image. There is NOTHING
+# in it except the CA bundle, /etc/passwd, timezone data, and your agent.
+ARG QUILT_BASE_VARIANT=scratch
+ARG QUILT_BASE_VERSION=0.1.0
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VCS_URL=https://github.com/SuperInstance/quilt-base
+
+LABEL org.opencontainers.image.title="quilt-base" \
+      org.opencontainers.image.description="Scratch base image (no OS) for the Quilt agent ecosystem. Use only with statically-linked binaries." \
+      org.opencontainers.image.vendor="Quilt" \
+      org.opencontainers.image.url="${VCS_URL}" \
+      org.opencontainers.image.source="${VCS_URL}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${QUILT_BASE_VERSION}" \
+      org.opencontainers.image.documentation="${VCS_URL}/blob/main/README.md" \
+      io.quilt.base.variant="${QUILT_BASE_VARIANT}" \
+      io.quilt.base.target_size_mb="4" \
+      io.quilt.base.shell="false" \
+      io.quilt.base.requires_static_binary="true"
+
+# The agent binary IS the entrypoint. No shell, no init, no tini.
+# If your agent is not a good PID 1, wrap it with a tiny C tini in a
+# sibling stage and ENTRYPOINT that instead.
+ENTRYPOINT ["/quilt/bin/agent"]
+
+# No CMD — downstream images can supply args via `docker run image arg1`.
+CMD []
+
+# No HEALTHCHECK, no USER, no WORKDIR — there is nothing to check, no
+# users to switch to, and the working directory is meaningless when the
+# filesystem is empty. Downstream agents set these as needed.
+
+# No EXPOSE — the agent decides which port(s) it binds.

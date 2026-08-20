@@ -1,0 +1,96 @@
+# =============================================================================
+# Quilt Base - .editorconfig
+# =============================================================================
+# EditorConfig (https://editorconfig.org) keeps whitespace, indentation, and
+# line endings consistent across editors and operating systems. This file is
+# authoritative for every Quilt repository, including this base image repo:
+#   - Shell scripts, Dockerfiles, YAML, and Markdown use the "spaces" rules.
+#   - Go / Rust (when present) use the "tabs" rules.
+#   - All files end with a single newline; trailing whitespace is forbidden
+#     except in Markdown where two trailing spaces are a hard line break.
+# =============================================================================
+
+root = true
+
+# -----------------------------------------------------------------------------
+# Defaults — apply to every file that does not have a more specific rule below.
+# -----------------------------------------------------------------------------
+[*]
+charset                  = utf-8
+end_of_line               = lf
+insert_final_newline      = true
+trim_trailing_whitespace  = true
+indent_style              = space
+indent_size               = 2
+
+# -----------------------------------------------------------------------------
+# Markdown — allow two trailing spaces (hard line break) and longer lines.
+# -----------------------------------------------------------------------------
+[*.{md,markdown}]
+trim_trailing_whitespace = false
+max_line_length          = off
+
+# -----------------------------------------------------------------------------
+# Shell scripts — 2-space indent, shebangs are honored by every POSIX shell.
+# -----------------------------------------------------------------------------
+[*.{sh,bash}]
+indent_style = space
+indent_size  = 2
+
+# -----------------------------------------------------------------------------
+# Dockerfiles — 4-space indent to match the upstream moby convention and to
+# keep nested RUN / COPY / ARG blocks visually distinct from JSON arrays.
+# -----------------------------------------------------------------------------
+[{Dockerfile,Dockerfile.*,*.dockerfile,*.containerfile}]
+indent_style = space
+indent_size  = 4
+
+# -----------------------------------------------------------------------------
+# YAML — 2-space indent; consistent with GitHub Actions and Kubernetes.
+# -----------------------------------------------------------------------------
+[*.{yml,yaml}]
+indent_style = space
+indent_size  = 2
+
+# -----------------------------------------------------------------------------
+# JSON — 2-space indent.
+# -----------------------------------------------------------------------------
+[*.json]
+indent_style = space
+indent_size  = 2
+
+# -----------------------------------------------------------------------------
+# Go (in case Go-based helpers are added later) — tabs, 4-wide.
+# -----------------------------------------------------------------------------
+[*.go]
+indent_style = tab
+indent_size  = 4
+
+# -----------------------------------------------------------------------------
+# Rust (used by the rust-agent example) — tabs, 4-wide.
+# -----------------------------------------------------------------------------
+[*.{rs,toml}]
+indent_style = tab
+indent_size  = 4
+
+# -----------------------------------------------------------------------------
+# TypeScript / JavaScript — 2 spaces, no semicolon preference, single quotes.
+# -----------------------------------------------------------------------------
+[*.{ts,tsx,js,jsx,mjs,cjs}]
+indent_style = space
+indent_size  = 2
+quote_type   = single
+
+# -----------------------------------------------------------------------------
+# Makefiles — MUST use real tabs for recipe lines. We set indent_style to
+# "tab" defensively but Makefile tooling typically enforces this itself.
+# -----------------------------------------------------------------------------
+[{Makefile,makefile,GNUmakefile,*.mk}]
+indent_style = tab
+
+# -----------------------------------------------------------------------------
+# Windows-specific override — force CRLF for batch / PowerShell files only.
+# Everything else stays LF for cross-platform repo hygiene.
+# -----------------------------------------------------------------------------
+[*.{bat,cmd,ps1}]
+end_of_line = crlf

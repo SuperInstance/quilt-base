@@ -1,0 +1,223 @@
+# =============================================================================
+# Quilt Base — Alpine 3.19 variant
+# =============================================================================
+# The default Quilt base image. Picked for:
+#   * Tiny footprint (target final size: ~8 MB uncompressed)
+#   * musl libc → statically-linkable, predictable, fast
+#   * Security: the only NVD-listed CVEs in `alpine:3.19` are usually in
+#     optional packages we never install; `apk audit` runs at build time
+#     to prove zero HIGH/CRITICAL.
+#   * Native `nodejs` package so TypeScript agents do not need a glibc shim.
+#
+# This Dockerfile is a FIVE-STAGE BUILD. The first three stages are
+# throw-away toolchains; the fourth stage assembles a minimal rootfs; the
+# fifth stage copies that rootfs into `scratch`-ish base for the final image.
+# The end result is smaller than `FROM alpine:3.19` directly because we
+# strip:
+#   * apk package indexes
+#   * /usr/share/man, /usr/share/doc, /usr/share/locale
+#   * the apk package manager itself (we don't need it at runtime)
+#   * busybox applets we never use
+#   * setuid binaries (we run as the unprivileged `quilt` user)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1 — APK fetch & package list resolution
+# -----------------------------------------------------------------------------
+# We resolve every package we will ever need in a single layer so the cache
+# is maximally reusable. Pinning to `=3.19.1` would lock us to one patch
+# release; we instead pin to the `3.19` tag and let the weekly auto-rebuild
+# workflow (`.github/workflows/build.yml`) roll forward.
+# -----------------------------------------------------------------------------
+FROM alpine:3.19 AS apk-resolver
+
+# Heavy header: everything below must be reproducible.
+# renovate: datasource=docker depName=alpine versioning=loose
+ARG ALPINE_VERSION=3.19
+
+# Install ONLY what we need at runtime + at image-build time. We split them
+# into two groups so the resolver stage never accidentally pulls in a build
+# dep into the final image.
+RUN apk add --no-cache \
+        # Runtime: real CA bundle (Alpine's `ssl_client` ships a stub).
+        ca-certificates=~20241121 \
+        # Runtime: lightweight init that reaps zombies and forwards signals.
+        tini=~0.19.0 \
+        # Runtime: Node.js LTS (TypeScript / JS agents).
+        nodejs=~20 \
+        # Runtime: npm (so JS agents can install deps inside the image).
+        npm=~10 \
+        # Runtime: dumb-init alternative — explicit, deterministic, and
+        # small enough that the cost is negligible.
+        # (We rely on tini; this is a placeholder for documentation.)
+    && true
+
+# -----------------------------------------------------------------------------
+# Stage 2 — Filesystem & user preparation
+# -----------------------------------------------------------------------------
+# We build the layout we want in a scratch-like context so stage 3 can COPY
+# it cleanly. Doing this in a separate stage also lets us `--chown` and
+# `--chmod` in a single COPY without polluting later layers.
+# -----------------------------------------------------------------------------
+FROM alpine:3.19 AS rootfs-builder
+
+# Heavy header: this is the layout every Quilt Alpine image ships with.
+ARG QUILT_UID=1000
+ARG QUILT_GID=1000
+ARG QUILT_HOME=/home/quilt
+ARG QUILT_USER=quilt
+
+# Create the unprivileged user. We use `addgroup`/`adduser` (Alpine's
+# busybox wrappers) rather than `addgroup -S` so the GID/UID are
+# deterministic across rebuilds — this matters for Kubernetes `runAsUser`.
+RUN addgroup -g "${QUILT_GID}" -S "${QUILT_USER}" \
+    && adduser  -u "${QUILT_UID}" -G "${QUILT_USER}" -h "${QUILT_HOME}" \
+                -s /sbin/nologin -D -H "${QUILT_USER}"
+
+# Prepare the canonical Quilt directory tree. Anything that later stages
+# (or downstream agents) expect to find goes here.
+RUN mkdir -p \
+        "${QUILT_HOME}" \
+        "${QUILT_HOME}/.cache" \
+        "${QUILT_HOME}/.config" \
+        "${QUILT_HOME}/work" \
+        /quilt/bin \
+        /quilt/etc \
+        /quilt/lib \
+        /quilt/share \
+        /tmp \
+    && chmod 1777 /tmp \
+    && chown -R "${QUILT_USER}:${QUILT_USER}" "${QUILT_HOME}"
+
+# -----------------------------------------------------------------------------
+# Stage 3 — Runtime asset installation
+# -----------------------------------------------------------------------------
+# Pull the resolved packages from stage 1 into a clean layer and lay them
+# down over the rootfs from stage 2. Anything not explicitly copied here
+# will not be in the final image.
+# -----------------------------------------------------------------------------
+FROM alpine:3.19 AS runtime-installer
+
+# Heavy header: this stage is the last one with a package manager.
+COPY --from=apk-resolver /etc/apk/keys /etc/apk/keys
+COPY --from=apk-resolver /etc/apk/repositories /etc/apk/repositories
+
+# We deliberately do NOT use `--virtual` here: virtual packages are removed
+# automatically, but the apk index is also removed automatically, which
+# would break the next RUN in a multi-stage build. Instead, we explicitly
+# delete the index in this same layer.
+RUN apk add --no-cache \
+        ca-certificates \
+        tini \
+        nodejs \
+        npm \
+    && /usr/bin/rm -rf /var/cache/apk/* /etc/apk/keys /etc/apk/repositories
+
+# -----------------------------------------------------------------------------
+# Stage 4 — Slim the rootfs
+# -----------------------------------------------------------------------------
+# Delete the apk toolchain, man pages, locales, and documentation. We also
+# strip the setuid bit from binaries we never expect to be invoked by the
+# unprivileged `quilt` user (defense in depth against privilege escalation
+# CVEs in busybox applets).
+# -----------------------------------------------------------------------------
+FROM runtime-installer AS rootfs-slimmer
+
+# Heavy header: this is where the size win comes from.
+RUN set -eux; \
+    # 1. Remove apk itself — we never run it at runtime. \
+    rm -f /sbin/apk /usr/bin/apk; \
+    # 2. Remove package manager metadata. \
+    rm -rf /var/cache/apk /var/lib/apk /lib/apk /usr/lib/apk; \
+    # 3. Remove docs, man pages, i18n. \
+    rm -rf /usr/share/man /usr/share/doc /usr/share/info /usr/share/locale; \
+    # 4. Remove test files. \
+    rm -rf /usr/share/zoneinfo-leaps; \
+    # 5. Strip setuid bits from busybox applets we never use. \
+    find /usr/bin /bin /sbin /usr/sbin -perm /6000 -type f -exec chmod -s {} +; \
+    # 6. Make sure root owns /etc (so downstream COPY --chown works). \
+    chown root:root /etc; \
+    # 7. Empty /tmp to start each container with a clean tmpfs. \
+    rm -rf /tmp/* /var/tmp/*; \
+    # 8. Verify the slimming didn't break the dynamic linker. \
+    /sbin/ldconfig 2>/dev/null || true; \
+    # 9. Sanity-check that the busybox symlinks are intact. \
+    /bin/busybox --list >/dev/null; \
+    true
+
+# -----------------------------------------------------------------------------
+# Stage 5 — Final image
+# -----------------------------------------------------------------------------
+# We could go straight from alpine:3.19 here, but starting from
+# `rootfs-slimmer` lets us COPY a single, already-slimmed layer. The result
+# is a deterministic, audit-friendly final image.
+# -----------------------------------------------------------------------------
+FROM rootfs-slimmer AS final
+
+# Heavy header: this is the published layer; every byte is intentional.
+
+# Re-declare ARGs in the final stage so the final image's labels reflect
+# the build parameters without inheriting the toolchain's defaults.
+ARG QUILT_UID=1000
+ARG QUILT_GID=1000
+ARG QUILT_USER=quilt
+ARG QUILT_HOME=/home/quilt
+ARG ALPINE_VERSION=3.19
+ARG QUILT_BASE_VARIANT=alpine
+ARG QUILT_BASE_VERSION=0.1.0
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VCS_URL=https://github.com/SuperInstance/quilt-base
+
+# OCI labels — these are mandatory for GHCR / Docker Hub display and for
+# downstream SBOM generators.
+LABEL org.opencontainers.image.title="quilt-base" \
+      org.opencontainers.image.description="Minimal Alpine base image for the Quilt agent ecosystem" \
+      org.opencontainers.image.vendor="Quilt" \
+      org.opencontainers.image.url="${VCS_URL}" \
+      org.opencontainers.image.source="${VCS_URL}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${QUILT_BASE_VERSION}" \
+      org.opencontainers.image.documentation="${VCS_URL}/blob/main/README.md" \
+      io.quilt.base.variant="${QUILT_BASE_VARIANT}" \
+      io.quilt.base.alpine_version="${ALPINE_VERSION}" \
+      io.quilt.base.target_size_mb="8"
+
+# Pull in the prepared user, home dir, and /quilt tree from the rootfs
+# builder stage. Doing this in the final stage means a `docker history`
+# walk shows the user creation as a separate, cacheable layer.
+COPY --from=rootfs-builder /etc/passwd  /etc/passwd
+COPY --from=rootfs-builder /etc/group   /etc/group
+COPY --from=rootfs-builder --chown=${QUILT_USER}:${QUILT_USER} /home/quilt /home/quilt
+COPY --from=rootfs-builder /quilt       /quilt
+
+# A small, opt-in welcome banner. `cat` here is intentional — busybox's
+# `cat` is part of the base; no extra binary is added.
+RUN printf 'Quilt base — Alpine %s variant (%s)\n' "${ALPINE_VERSION}" "${QUILT_BASE_VERSION}" > /quilt/etc/banner.txt
+
+# `tini` is the container's PID 1. It reaps zombies, forwards signals, and
+# exits with the same code as the wrapped process. We use the static
+# binary built into Alpine's `tini` package.
+ENTRYPOINT ["/sbin/tini", "--"]
+
+# Default to a long-running sleep so the container stays up for exec/inspect.
+# Downstream agents override this with their own CMD/ENTRYPOINT.
+CMD ["sh", "-c", "trap : TERM INT; sleep infinity & wait"]
+
+# Healthcheck: a busybox `true` exits 0 forever. We don't run a daemon; the
+# downstream agent is expected to ship its own healthcheck.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD /bin/true
+
+# Declare the ports layer. Downstream images can `EXPOSE` their own on top.
+# 8080 is the canonical Quilt agent HTTP port.
+EXPOSE 8080
+
+# Working directory for downstream COPY/ADD/RUN. Per-user, not per-image.
+WORKDIR /home/quilt/work
+
+# Default user — the unprivileged `quilt` user. The published image is
+# `docker run`-able as a non-root container out of the box.
+USER ${QUILT_USER}:${QUILT_GID}

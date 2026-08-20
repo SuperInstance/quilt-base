@@ -1,0 +1,46 @@
+# =============================================================================
+# Quilt Base - CODEOWNERS
+# =============================================================================
+# Every change to this repository MUST be reviewed and approved by the Quilt
+# maintainer. CODEOWNERS is enforced by GitHub for pull request merging; any
+# PR that does not have an approving review from @CaseyDiGennaro will be
+# blocked at the branch-protection level.
+#
+# Path-matching rules are evaluated top-to-bottom; the LAST match wins, so
+# the "default" rule at the bottom is the catch-all. Be explicit per-area.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Global default — everything is owned by the project lead.
+# -----------------------------------------------------------------------------
+*                                               @CaseyDiGennaro
+
+# -----------------------------------------------------------------------------
+# Workflows / CI — only the platform team may change pipeline behavior.
+# -----------------------------------------------------------------------------
+/.github/workflows/                             @CaseyDiGennaro
+/.github/dependabot.yml                         @CaseyDiGennaro
+/.github/CODEOWNERS                             @CaseyDiGennaro
+
+# -----------------------------------------------------------------------------
+# Docker images — changes here trigger rebuilds of every Quilt agent image.
+# -----------------------------------------------------------------------------
+/docker/                                        @CaseyDiGennaro
+
+# -----------------------------------------------------------------------------
+# Security tooling — CVE scanners, SBOM generators, and policy files.
+# -----------------------------------------------------------------------------
+/security/                                      @CaseyDiGennaro
+/scripts/sbom-generate.sh                       @CaseyDiGennaro
+/SECURITY.md                                    @CaseyDiGennaro
+
+# -----------------------------------------------------------------------------
+# Examples — templates consumed by sibling Quilt repos. Changes here should
+# land alongside a coordinated update in those repos.
+# -----------------------------------------------------------------------------
+/examples/                                      @CaseyDiGennaro
+
+# -----------------------------------------------------------------------------
+# License / legal
+# -----------------------------------------------------------------------------
+/LICENSE                                        @CaseyDiGennaro

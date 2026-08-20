@@ -1,0 +1,134 @@
+# =============================================================================
+# Quilt Base - Dependabot configuration
+# =============================================================================
+# Dependabot keeps our pinned base-image digests, GitHub Actions versions, and
+# (rarely) Dockerfile `apk add` package versions current. Combined with the
+# weekly auto-rebuild workflow, this means every Quilt base image is rebuilt
+# at least once per week with the latest upstream security patches.
+#
+# We pin Dependabot to a single weekly schedule so we do not get flooded with
+# PRs on top of our own CVE-driven rebuilds. The auto-rebuild workflow then
+# tags and pushes the resulting image to GHCR automatically.
+# =============================================================================
+
+version: 2
+
+# -----------------------------------------------------------------------------
+# Update orchestrator — keep the entire repo together.
+# -----------------------------------------------------------------------------
+updates:
+
+  # ---------------------------------------------------------------------------
+  # 1. GitHub Actions versions
+  #    Track upstream releases of every action we use in our workflows.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "ci"
+      - "quilt-base/ci"
+    commit-message:
+      prefix: "ci(actions)"
+    groups:
+      github-actions-minor:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ---------------------------------------------------------------------------
+  # 2. Docker base-image digests
+  #    Watch each upstream image we FROM in our Dockerfiles for new tags /
+  #    digests. Bumping a digest here is what triggers the weekly rebuild.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "docker"
+      - "quilt-base/base"
+    commit-message:
+      prefix: "docker(base)"
+    # Alpine, Ubuntu, distroless, scratch — Dependabot will find the FROM
+    # lines in docker/Dockerfile.alpine, docker/Dockerfile.ubuntu,
+    # docker/Dockerfile.distroless, and docker/Dockerfile.scratch.
+    groups:
+      docker-base-major:
+        applies-to: version-updates
+        patterns:
+          - "alpine"
+          - "ubuntu"
+          - "gcr.io/distroless/*"
+        update-types:
+          - "major"
+
+  # ---------------------------------------------------------------------------
+  # 3. Dockerfile `apk add` / `apt-get install` package versions
+  #    We intentionally keep this off for most cases because base images
+  #    already include the latest patched packages. Uncomment if/when we
+  #    add application-level packages that need tracking.
+  # ---------------------------------------------------------------------------
+  # - package-ecosystem: "docker"
+  #   directory: "/docker"
+  #   schedule:
+  #     interval: "weekly"
+  #   allow:
+  #     dependency-type: "direct"
+
+  # ---------------------------------------------------------------------------
+  # 4. npm (used by the build/test tooling around the Dockerfiles)
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "06:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "npm"
+      - "quilt-base/tooling"
+    commit-message:
+      prefix: "chore(deps)"
+    ignore:
+      # We pin Node.js to the LTS line that ships in the base image.
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+    groups:
+      npm-minor:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ---------------------------------------------------------------------------
+  # 5. GitHub Actions security advisories — auto-PR fix for known vulns.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    labels:
+      - "security"
+      - "dependencies"
+    commit-message:
+      prefix: "fix(actions)"
+    # The weekly github-actions entry above already covers routine updates;
+    # this daily entry is purely for security advisories.
+    open-pull-requests-limit: 5

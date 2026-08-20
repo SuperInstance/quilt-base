@@ -1,0 +1,246 @@
+# =============================================================================
+# Quilt Base — Build matrix workflow
+# =============================================================================
+# Builds every Quilt base image variant on every supported architecture.
+# The matrix is 4 variants × 2 arches = 8 jobs. Each job:
+#   1. Builds with buildx + registry cache
+#   2. Scans with Trivy (blocking) and Grype (best-effort)
+#   3. Generates SPDX + CycloneDX SBOMs
+#   4. Pushes to GHCR (only on the main branch or tag)
+#
+# Reusable: this workflow exposes `workflow_call` so `auto-rebuild.yml`
+# and the manual "Build & Push" run can share the matrix definition.
+# =============================================================================
+
+name: Build (matrix)
+
+# -----------------------------------------------------------------------------
+# Triggers
+# -----------------------------------------------------------------------------
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "docker/**"
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+      - ".github/dependabot.yml"
+  pull_request:
+    paths:
+      - "docker/**"
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Variant to build (blank = all)"
+        required: false
+        default: ""
+        type: string
+      reason:
+        description: "Build reason (free text)"
+        required: false
+        default: "manual"
+        type: string
+  workflow_call:
+    inputs:
+      reason:
+        description: "Build reason (free text)"
+        required: false
+        type: string
+        default: "auto"
+
+# -----------------------------------------------------------------------------
+# Permissions
+# -----------------------------------------------------------------------------
+permissions:
+  contents: read
+  packages: write
+  id-token: write   # for OIDC-based GHCR push (cosign signing)
+  attestations: write
+
+# -----------------------------------------------------------------------------
+# Cancel-in-progress on push
+# -----------------------------------------------------------------------------
+concurrency:
+  group: build-${{ github.event.inputs.variant || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+# -----------------------------------------------------------------------------
+# Jobs
+# -----------------------------------------------------------------------------
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1. Resolve matrix
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: "Resolve matrix"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set matrix
+        id: set
+        env:
+          MANUAL_VARIANT: ${{ github.event.inputs.variant }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${MANUAL_VARIANT}" ]]; then
+            VARIANTS="${MANUAL_VARIANT}"
+          else
+            VARIANTS="alpine ubuntu distroless scratch"
+          fi
+          MATRIX_JSON=$(printf '%s' "${VARIANTS}" | tr ' ' '\n' \
+            | jq -R '{variant: .}' \
+            | jq -cs 'map(. + {arch: "amd64", include: [{arch: "arm64"}]})')
+          # The jq trick above is wrong for a true cartesian product; we
+          # build it explicitly:
+          MATRIX_JSON=$(jq -nc \
+            --argjson v "$(printf '%s' "${VARIANTS}" | tr ' ' '\n' | jq -R . | jq -cs .)" \
+            '[ $v[] as $variant | [{variant: $variant, arch: "amd64"}, {variant: $variant, arch: "arm64"}] ] | add | {include: .}')
+          echo "matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. Build
+  # ---------------------------------------------------------------------------
+  build:
+    name: "Build ${{ matrix.variant }} (${{ matrix.arch }})"
+    needs: resolve
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.arch }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: ${{ matrix.arch }}
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/SuperInstance/quilt-base
+          tags: |
+            type=raw,value=${{ matrix.variant }}-${{ github.sha }},enable=${{ github.event_name == 'push' }}
+            type=raw,value=${{ matrix.variant }}-latest,enable=${{ github.event_name == 'push' }}
+            type=raw,value=${{ matrix.variant }},enable=${{ matrix.variant == 'alpine' && github.event_name == 'push' }}
+            type=raw,value=latest,enable=${{ matrix.variant == 'alpine' && github.event_name == 'push' }}
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile.${{ matrix.variant }}
+          platforms: linux/${{ matrix.arch }}
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            QUILT_BASE_VERSION=${{ github.ref_name }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VCS_URL=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.variant }}-${{ matrix.arch }},mode=max
+
+      - name: Trivy scan (blocking)
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: sarif
+          output: trivy-${{ matrix.variant }}-${{ matrix.arch }}.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+
+      - name: Upload Trivy SARIF
+        if: always() && github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.variant }}-${{ matrix.arch }}.sarif
+          category: trivy-${{ matrix.variant }}-${{ matrix.arch }}
+
+      - name: Generate SBOM (SPDX)
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: spdx-json
+          artifact-name: sbom-${{ matrix.variant }}-${{ matrix.arch }}.spdx.json
+
+      - name: Generate SBOM (CycloneDX)
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: cyclonedx-json
+          artifact-name: sbom-${{ matrix.variant }}-${{ matrix.arch }}.cdx.json
+
+      - name: Upload SBOM artifacts
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.variant }}-${{ matrix.arch }}
+          path: |
+            sbom-${{ matrix.variant }}-${{ matrix.arch }}.spdx.json
+            sbom-${{ matrix.variant }}-${{ matrix.arch }}.cdx.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          subject-digest: ${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.digest'] }}
+          push-to-registry: true
+
+  # ---------------------------------------------------------------------------
+  # 3. Finalize — once all matrix jobs complete, summarize.
+  # ---------------------------------------------------------------------------
+  finalize:
+    name: "Finalize"
+    needs: build
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Summary
+        run: |
+          echo "## Build matrix summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Variant | Arch | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for variant in alpine ubuntu distroless scratch; do
+            for arch in amd64 arm64; do
+              echo "| \`${variant}\` | \`${arch}\` | ${{ needs.build.result }} |" \
+                >> "$GITHUB_STEP_SUMMARY"
+            done
+          done

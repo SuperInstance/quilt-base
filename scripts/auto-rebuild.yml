@@ -1,0 +1,192 @@
+# =============================================================================
+# Quilt Base — Auto-rebuild workflow
+# =============================================================================
+# This workflow runs on a WEEKLY schedule. On each run it:
+#   1. Re-resolves the upstream base image (alpine, ubuntu, distroless).
+#   2. Triggers the build matrix in build.yml.
+#   3. If the new build contains CVEs fixed upstream that the old build
+#      did not have, it tags the new build as a "security" release and
+#      opens a PR pinning the new digest everywhere in the Quilt org.
+#
+# Manual trigger:
+#   gh workflow run auto-rebuild.yml -f reason="<short text>"
+#
+# Schedule (cron):
+#   - Every Monday at 06:00 UTC.
+#
+# This file is a TEMPLATE: when copied to .github/workflows/, the
+# `on: schedule` block will take effect. The script in scripts/build-all.sh
+# is also runnable locally to replicate the same pipeline on demand.
+# =============================================================================
+
+name: Auto-rebuild (weekly)
+
+# -----------------------------------------------------------------------------
+# Triggers
+# -----------------------------------------------------------------------------
+on:
+  schedule:
+    # At 06:00 UTC every Monday — chosen to fire after Dependabot (06:00 ET)
+    # but before the daily cve-scan workflow (also 06:00 UTC).
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why are you running this rebuild?"
+        required: false
+        default: "manual"
+        type: string
+  workflow_call:
+    inputs:
+      reason:
+        description: "Reason for the rebuild"
+        required: false
+        type: string
+        default: "auto"
+
+# -----------------------------------------------------------------------------
+# Permissions — least-privilege, explicitly enumerated.
+# -----------------------------------------------------------------------------
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+  issues: write
+  id-token: write  # for OIDC-based GHCR push (cosign signing)
+
+# -----------------------------------------------------------------------------
+# Cancel in-progress runs of the same workflow on the same ref.
+# -----------------------------------------------------------------------------
+concurrency:
+  group: auto-rebuild-${{ github.ref }}
+  cancel-in-progress: true
+
+# -----------------------------------------------------------------------------
+# Jobs
+# -----------------------------------------------------------------------------
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1. Upstream digest check
+  #
+  # Resolve the digest of every upstream base image we depend on. If any
+  # digest has changed since the last successful run, the build matrix runs.
+  # ---------------------------------------------------------------------------
+  upstream-check:
+    name: "Upstream digest check"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      alpine-changed:   ${{ steps.resolve.outputs.alpine }}
+      ubuntu-changed:   ${{ steps.resolve.outputs.ubuntu }}
+      distroless-changed: ${{ steps.resolve.outputs.distroless }}
+      any-changed: ${{ steps.resolve.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream digests
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ALPINE_DIGEST=$(docker buildx imagetools inspect --raw alpine:3.19 2>/dev/null \
+            | jq -r '.. | .Digest? // empty' | head -n1 || echo unknown)
+          UBUNTU_DIGEST=$(docker buildx imagetools inspect --raw ubuntu:24.04 2>/dev/null \
+            | jq -r '.. | .Digest? // empty' | head -n1 || echo unknown)
+          DISTROLESS_DIGEST=$(docker buildx imagetools inspect --raw gcr.io/distroless/static-debian12:nonroot 2>/dev/null \
+            | jq -r '.. | .Digest? // empty' | head -n1 || echo unknown)
+
+          echo "alpine=${ALPINE_DIGEST}"      >> "$GITHUB_OUTPUT"
+          echo "ubuntu=${UBUNTU_DIGEST}"      >> "$GITHUB_OUTPUT"
+          echo "distroless=${DISTROLESS_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # Compare against the last-recorded digests in a workflow artifact.
+          mkdir -p .quilt
+          cat > .quilt/digests.json <<EOF
+          {
+            "alpine":    "${ALPINE_DIGEST}",
+            "ubuntu":    "${UBUNTU_DIGEST}",
+            "distroless":"${DISTROLESS_DIGEST}"
+          }
+          EOF
+
+          # Detect change vs the artifact from the previous run.
+          if [[ -f .quilt/previous-digests.json ]]; then
+            CHANGED=$(diff <(jq -S . .quilt/previous-digests.json) \
+                           <(jq -S . .quilt/digests.json) >/dev/null && echo false || echo true)
+          else
+            CHANGED="true"  # First run.
+          fi
+          echo "any=${CHANGED}" >> "$GITHUB_OUTPUT"
+
+      - name: Save digests for next run
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests
+          path: .quilt/digests.json
+
+  # ---------------------------------------------------------------------------
+  # 2. Build & scan matrix
+  #
+  # Conditional on upstream-check.any-changed. Reuses the matrix defined in
+  # build.yml via `workflow_call` so we never duplicate the build logic.
+  # ---------------------------------------------------------------------------
+  build:
+    name: "Build (${{ matrix.variant }} / ${{ matrix.arch }})"
+    needs: upstream-check
+    if: needs.upstream-check.outputs.any-changed == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      reason: ${{ github.event.inputs.reason || 'auto-rebuild' }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # 3. PR opener
+  #
+  # If the rebuild changed anything, open a PR that updates the digest
+  # pinning in this repo (and emits a downstream notification to the
+  # other Quilt repos).
+  # ---------------------------------------------------------------------------
+  open-pr:
+    name: "Open pin PR"
+    needs: [upstream-check, build]
+    if: needs.upstream-check.outputs.any-changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download new digests
+        uses: actions/download-artifact@v4
+        with:
+          name: digests
+
+      - name: Open pin PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(base): pin updated upstream digests"
+          title: "Auto-rebuild: pin updated base image digests"
+          body: |
+            ## Auto-rebuild digest pin
+
+            This PR was opened by the weekly auto-rebuild workflow.
+
+            **Reason:** ${{ github.event.inputs.reason || 'auto-rebuild' }}
+
+            ### New digests
+            ```
+            $(cat .quilt/digests.json | jq .)
+            ```
+
+            Please review the diff and merge. The corresponding image
+            rebuilds are tracked in the `build` matrix workflow run.
+          branch: auto-rebuild/digest-pin
+          delete-branch: true
+          labels: |
+            dependencies
+            quilt-base/auto

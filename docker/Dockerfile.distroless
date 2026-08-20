@@ -1,0 +1,142 @@
+# =============================================================================
+# Quilt Base — Google Distroless variant
+# =============================================================================
+# The "production" Quilt base. Use this when:
+#   * You want Google-grade hardening (no shell, no package manager,
+#     no `apt`, no `bash`).
+#   * Your agent is a single statically-linked binary or a self-contained
+#     language runtime (Go, Rust, Java/JRE, Node.js with --jarmode).
+#   * You need to satisfy a compliance regime (FedRAMP, SOC 2, PCI) that
+#     rejects any base image with a shell.
+#
+# Distroless images do NOT have a shell, package manager, or setuid
+# binaries. You CANNOT `docker exec -it ... sh` into them. This is a
+# feature: it makes a supply-chain attacker's job materially harder.
+#
+# Target final size: ~12 MB.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1 — Builder for any agent artifacts that need a toolchain
+# -----------------------------------------------------------------------------
+# This stage is OPTIONAL — if your agent ships a pre-built binary, you can
+# delete stage 1 and start from `gcr.io/distroless/...` directly. We
+# include it because most Quilt agents will use this Dockerfile as a
+# template and need somewhere to compile.
+# -----------------------------------------------------------------------------
+FROM ubuntu:24.04 AS builder
+
+# Heavy header: toolchain stage. None of this lands in the final image.
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN set -eux; \
+    apt-get update -y; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        build-essential \
+        gcc \
+        g++ \
+        make \
+        pkg-config \
+        git \
+        curl \
+        wget \
+    ; \
+    rm -rf /var/lib/apt/lists/*; \
+    true
+
+# The `WORKDIR` here is where downstream agents COPY their source and run
+# their own build commands. We leave it empty by default.
+WORKDIR /build
+
+# -----------------------------------------------------------------------------
+# Stage 2 — CA bundle + non-root user prep
+# -----------------------------------------------------------------------------
+# We stage the CA bundle and the unprivileged user in their own layer so
+# the final image inherits them deterministically.
+# -----------------------------------------------------------------------------
+FROM gcr.io/distroless/static-debian12:nonroot AS rootfs-prep
+
+# Heavy header: this stage emits the layer the final image starts from.
+
+# Distroless already includes /etc/passwd with the `nonroot` user (UID
+# 65532). We layer our `quilt` user on top by appending to /etc/passwd
+# and /etc/group. This works because distroless exposes /etc as a
+# writable layer via the OCI spec.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# The `nonroot` user is shipped with the base; we additionally want a
+# `quilt` user with UID 1000 for symmetry with the Alpine and Ubuntu
+# variants. We use sed in the buildkit heredoc to append it.
+# NOTE: distroless has no shell, so we cannot `RUN` this — we COPY a
+# pre-baked passwd/group file in. See /security/distroless/passwd and
+# /security/distroless/group in a real deployment; for this template we
+# inline the entries as build args.
+ARG QUILT_UID=1000
+ARG QUILT_GID=1000
+ARG QUILT_USER=quilt
+ARG QUILT_HOME=/home/quilt
+
+# These COPY lines assume you have built /etc/passwd and /etc/group
+# externally. For the default image (no `quilt` user), they are no-ops.
+# Uncomment and provide the files if you need the `quilt` user.
+# COPY --chown=0:0 security/distroless/passwd /etc/passwd
+# COPY --chown=0:0 security/distroless/group  /etc/group
+# COPY --chown=${QUILT_UID}:${QUILT_GID} --chmod=0755 <builder-stage> ${QUILT_HOME}
+
+# -----------------------------------------------------------------------------
+# Stage 3 — Final image
+# -----------------------------------------------------------------------------
+# We start from `rootfs-prep` (the distroless nonroot variant). Anything
+# downstream agents COPY into this stage MUST be statically linked, a
+# pure-interpreted language with no glibc dependency, or a self-contained
+# runtime like a JRE.
+# -----------------------------------------------------------------------------
+FROM rootfs-prep AS final
+
+# Heavy header: published layer. NO shell. NO package manager.
+ARG QUILT_BASE_VARIANT=distroless
+ARG QUILT_BASE_VERSION=0.1.0
+ARG DISTROLESS_BASE=gcr.io/distroless/static-debian12
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VCS_URL=https://github.com/SuperInstance/quilt-base
+
+LABEL org.opencontainers.image.title="quilt-base" \
+      org.opencontainers.image.description="Google Distroless base image for the Quilt agent ecosystem (no shell, no package manager)" \
+      org.opencontainers.image.vendor="Quilt" \
+      org.opencontainers.image.url="${VCS_URL}" \
+      org.opencontainers.image.source="${VCS_URL}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${QUILT_BASE_VERSION}" \
+      org.opencontainers.image.documentation="${VCS_URL}/blob/main/README.md" \
+      io.quilt.base.variant="${QUILT_BASE_VARIANT}" \
+      io.quilt.base.distroless_base="${DISTROLESS_BASE}" \
+      io.quilt.base.target_size_mb="12" \
+      io.quilt.base.shell="false"
+
+# Distroless has no HEALTHCHECK (no shell, no /bin/true). Downstream
+# agents that need a healthcheck must add their own binary.
+# HEALTHCHECK NONE
+
+# The Quilt agent HTTP port. Downstream agents that listen on a different
+# port should override this with `EXPOSE <port>`.
+EXPOSE 8080
+
+# distroless ships with `nonroot` as the default user. We keep that.
+# If you COPY'd a `quilt` user into /etc/passwd, change this to:
+#   USER ${QUILT_UID}:${QUILT_GID}
+USER nonroot:nonroot
+
+# No ENTRYPOINT — distroless images should not have a default executable.
+# Downstream agents MUST set ENTRYPOINT to their binary. The commented
+# line below is a placeholder; do not uncomment unless your binary is
+# called /quilt/bin/agent.
+# ENTRYPOINT ["/quilt/bin/agent"]
+# CMD []
+
+# Final note: there is intentionally no WORKDIR. Each downstream image
+# sets its own to avoid surprising users with a different working
+# directory than they expect.

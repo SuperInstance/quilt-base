@@ -1,0 +1,204 @@
+# =============================================================================
+# Quilt Base — Ubuntu 24.04 LTS variant
+# =============================================================================
+# The "I need glibc" Quilt base. Use this when:
+#   * Your agent is a glibc-linked binary (most pre-built Node.js
+#     distributions, Python with C extensions, Java, Go binaries built
+#     with `CGO_ENABLED=1`, etc.)
+#   * You depend on a Linux distribution's LTS support window (Ubuntu
+#     24.04 is supported until 2029).
+#   * Your auditors require a Debian-derived base for compliance reasons.
+#
+# This is a FOUR-STAGE BUILD (one fewer than Alpine because Ubuntu's
+# package manager is too heavy to safely delete at runtime, so we instead
+# use `chroot`-style copy in the final stage). Target final size: ~28 MB.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1 — apt index
+# -----------------------------------------------------------------------------
+# We pre-warm the apt index in its own layer so the package install in
+# stage 2 is cacheable across version bumps of individual packages.
+# -----------------------------------------------------------------------------
+FROM ubuntu:24.04 AS apt-index
+
+# Heavy header: this stage only touches the package index.
+ARG DEBIAN_FRONTEND=noninteractive
+ARG APT_GET="/usr/bin/apt-get"
+ARG CLEANUP="rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb"
+
+# Disable manpages, locales, and docs system-wide via dpkg config so the
+# `apt-get install` in stage 2 doesn't pull them. This is the single
+# biggest size win for Ubuntu bases.
+RUN set -eux; \
+    printf 'path-exclude /usr/share/doc/*\npath-include /usr/share/doc/*/copyright\npath-exclude /usr/share/man/*\npath-exclude /usr/share/locale/*\npath-exclude /usr/share/info/*\npath-exclude /usr/share/zoneinfo-leaps/*\n' \
+        > /etc/dpkg/dpkg.cfg.d/01-nodoc; \
+    printf 'Acquire::Languages "none";\n' \
+        > /etc/apt/apt.conf.d/99-no-translations; \
+    printf 'Acquire::GzipIndexes "true";\nAcquire::CompressionTypes::Order:: "gz";\n' \
+        > /etc/apt/apt.conf.d/99-compression; \
+    ${APT_GET} update -y; \
+    ${CLEANUP}
+
+# -----------------------------------------------------------------------------
+# Stage 2 — Runtime package installation
+# -----------------------------------------------------------------------------
+# Install only the packages we ship in the final image. The list is
+# deliberately small; downstream agents add their own.
+# -----------------------------------------------------------------------------
+FROM apt-index AS runtime-installer
+
+# Heavy header: this stage becomes the final image's filesystem.
+ARG DEBIAN_FRONTEND=noninteractive
+ARG QUILT_UID=1000
+ARG QUILT_GID=1000
+ARG QUILT_USER=quilt
+ARG QUILT_HOME=/home/quilt
+
+# Install — pinned to the Ubuntu 24.04 "noble" pocket only. We do NOT
+# use `ubuntu:24.04` rolling or any -updates pocket; Dependabot will
+# bump the FROM line when a new LTS is needed.
+#   ca-certificates — Mozilla CA bundle
+#   tini            — minimal init
+#   nodejs          — LTS for TypeScript agents (from nodesource if needed,
+#                     but the noble pocket ships a recent enough version)
+#   npm             — bundled with nodejs
+#   dumb-init       — alternative init (kept available; default is tini)
+#   bash-completion — convenience for `quilt exec` sessions
+RUN set -eux; \
+    apt-get update -y; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tini \
+        nodejs \
+        npm \
+        bash-completion \
+        coreutils \
+        findutils \
+        grep \
+        sed \
+        gawk \
+        curl \
+        ca-certificates \
+    ; \
+    apt-get autoremove --purge -y; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/log/apt/* /var/log/dpkg.log; \
+    # dpkg-divert the docs/locale dirs we already excluded in stage 1. \
+    rm -rf /usr/share/doc /usr/share/man /usr/share/info /usr/share/locale /usr/share/zoneinfo-leaps; \
+    true
+
+# Create the canonical `quilt` user. We use Ubuntu's `useradd` directly
+# rather than `adduser` so the shell is `/usr/sbin/nologin` (no shell,
+# no login — agent runs as a service).
+RUN set -eux; \
+    groupadd --system --gid "${QUILT_GID}" "${QUILT_USER}"; \
+    useradd  --system --uid "${QUILT_UID}" \
+             --gid "${QUILT_GID}" \
+             --home-dir "${QUILT_HOME}" \
+             --shell /usr/sbin/nologin \
+             --no-create-home \
+             --comment "Quilt agent user" \
+             "${QUILT_USER}"; \
+    install -d -m 0755 -o "${QUILT_USER}" -g "${QUILT_USER}" \
+        "${QUILT_HOME}" \
+        "${QUILT_HOME}/.cache" \
+        "${QUILT_HOME}/.config" \
+        "${QUILT_HOME}/work"; \
+    install -d -m 0755 -o root -g root /quilt/{bin,etc,lib,share}; \
+    chmod 1777 /tmp; \
+    true
+
+# -----------------------------------------------------------------------------
+# Stage 3 — Strip setuid bits & non-essentials
+# -----------------------------------------------------------------------------
+# Ubuntu's base image ships with several setuid binaries (su, sudo, mount,
+# umount, passwd, etc.) that an agent container has no business running.
+# Stripping them is defense in depth — even if a CVE gives a non-root
+# attacker setuid escalation, those binaries will refuse to do anything.
+# -----------------------------------------------------------------------------
+FROM runtime-installer AS rootfs-slimmer
+
+# Heavy header: this is the last layer that mutates the image.
+RUN set -eux; \
+    # 1. Strip setuid bits from binaries we never expect an agent to need. \
+    for f in /bin/su /usr/bin/su /bin/mount /bin/umount /usr/bin/mount /usr/bin/umount \
+             /usr/bin/passwd /usr/bin/chsh /usr/bin/chfn /usr/bin/gpasswd /usr/bin/newgrp \
+             /usr/bin/sudo /usr/bin/pkexec; do \
+        [ -e "$f" ] && chmod -s "$f" || true; \
+    done; \
+    # 2. Remove the apt toolchain entirely. \
+    rm -rf /usr/bin/apt /usr/bin/apt-get /usr/bin/apt-cache /usr/bin/apt-config \
+           /usr/bin/dpkg /usr/bin/dpkg-deb /usr/bin/dpkg-divert /usr/bin/dpkg-statoverride \
+           /var/lib/dpkg /var/lib/apt /var/cache/apt /var/log/apt /var/log/dpkg.log; \
+    # 3. Remove cron / anacron / at — agents schedule with their own timers. \
+    rm -rf /etc/cron.* /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; \
+    # 4. Remove `/usr/share/bug` and `/usr/share/lintian`. \
+    rm -rf /usr/share/bug /usr/share/lintian; \
+    # 5. Remove kernel modules — they do not work in a container anyway. \
+    rm -rf /lib/modules /usr/lib/modules; \
+    # 6. Verify the dynamic linker is still functional. \
+    /usr/sbin/ldconfig; \
+    true
+
+# -----------------------------------------------------------------------------
+# Stage 4 — Final image
+# -----------------------------------------------------------------------------
+# Re-declare ARGs and emit OCI labels. The image starts from the slimmed
+# stage 3 — we do NOT use `FROM scratch` because we want a real /etc,
+# /proc, /sys, /dev tree for downstream agents.
+# -----------------------------------------------------------------------------
+FROM rootfs-slimmer AS final
+
+# Heavy header: published layer.
+ARG QUILT_USER=quilt
+ARG QUILT_UID=1000
+ARG QUILT_GID=1000
+ARG QUILT_BASE_VARIANT=ubuntu
+ARG QUILT_BASE_VERSION=0.1.0
+ARG UBUNTU_VERSION=24.04
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VCS_URL=https://github.com/SuperInstance/quilt-base
+
+LABEL org.opencontainers.image.title="quilt-base" \
+      org.opencontainers.image.description="Minimal Ubuntu 24.04 LTS base image for the Quilt agent ecosystem" \
+      org.opencontainers.image.vendor="Quilt" \
+      org.opencontainers.image.url="${VCS_URL}" \
+      org.opencontainers.image.source="${VCS_URL}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${QUILT_BASE_VERSION}" \
+      org.opencontainers.image.documentation="${VCS_URL}/blob/main/README.md" \
+      io.quilt.base.variant="${QUILT_BASE_VARIANT}" \
+      io.quilt.base.ubuntu_version="${UBUNTU_VERSION}" \
+      io.quilt.base.target_size_mb="28"
+
+# Re-assert the prepared user. `useradd` already created the account, but
+# declaring USER here means `docker run` will be non-root by default.
+USER ${QUILT_UID}:${QUILT_GID}
+
+# tini as PID 1; downstream agents override ENTRYPOINT/CMD.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sh", "-c", "trap : TERM INT; sleep infinity & wait"]
+
+# Long-running, no-op healthcheck.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD /bin/true
+
+# Canonical Quilt agent HTTP port.
+EXPOSE 8080
+
+# Default working directory.
+WORKDIR /home/quilt/work
+
+# Re-state env so downstream images inherit our conventions.
+ENV QUILT_BASE_VARIANT=ubuntu \
+    QUILT_BASE_VERSION=0.1.0 \
+    QUILT_HOME=/home/quilt \
+    QUILT_USER=quilt \
+    DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/quilt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
